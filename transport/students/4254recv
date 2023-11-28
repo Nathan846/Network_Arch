@@ -1,68 +1,116 @@
 #!/usr/bin/python3 -u
-#
-
 
 import sys
 import socket
 import time
 import datetime
-import select
 import json
-
 from base64 import b64decode
-
-def log(string):
-  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
 
 MSG_SIZE = 1500
 TIMEOUT = 30
+
+def log(message):
+    current_time = datetime.datetime.now().strftime("%H:%M:%S.%f")
+    sys.stderr.write(f"{current_time} {message}\n")
+
+def print_packets_in_order():
+    sorted_packets = dict(sorted(packets_received.items()))
+    for packet in sorted_packets.values():
+        data = b64decode(packet['data'].encode())
+        sys.stdout.buffer.write(data)
+
+# Function to send cumulative acknowledgment
+def send_ack():
+    sequence = 0
+    ack_to_send = None
+    prev_entry = None
+    curr_entry = packets_received.get(sequence)
+
+    while True:
+        prev_entry = curr_entry
+        curr_entry = packets_received.get(sequence)
+
+        if curr_entry is None:
+            ack_to_send = prev_entry
+            break
+        else:
+            if curr_entry['eof']:
+                ack_to_send = curr_entry
+                break
+        sequence += len(curr_entry['data'])
+
+    ack_msg = {"ack": ack_to_send['sequence'] + len(ack_to_send['data'])}
+    log(f"ABOUT TO SEND {json.dumps(ack_msg)}")
+
+    if sock.sendto(json.dumps(ack_msg).encode(), addr) < len(json.dumps(ack_msg)):
+        log("[error] unable to fully send acknowledgment")
+
+# Initialize variables
+packets_received = {}
+last_ack = 0
 
 # Bind to localhost and an ephemeral port
 UDP_IP = "127.0.0.1"
 UDP_PORT = int(sys.argv[1])
 
 # Set up the socket
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_IP, UDP_PORT))
 sock.settimeout(TIMEOUT)
 
 # Get port we bound to
 UDP_PORT = sock.getsockname()[1]
-log("[bound] " + str(UDP_PORT))
+log(f"[bound] {UDP_PORT}")
 
 # Now listen for packets
 while True:
-  result = sock.recvfrom(MSG_SIZE)
-
-  # If nothing is ready, we hit the timeout
-  if result:
-    (data, addr) = result # note, data is bytes, so we must convert back to string before use
-
     try:
-      decoded = json.loads(data.decode())
+        data, addr = sock.recvfrom(MSG_SIZE)
 
-      # If the EOF flag is set, exit
-      if (decoded['eof']):
-        log("[completed]")
-        sys.exit(0)
+        decoded = json.loads(data.decode())
 
-      # If there is data, we accept it and print it out
-      if (decoded['data']):
+        if decoded['eof']:
+            packets_received[decoded['sequence'] + 1] = decoded
+            log(f"\n[UPDATING RECEIVED PACKETS] {packets_received}")
+            last_ack = decoded['sequence'] + 1
+            ack_msg = {"ack": decoded['sequence'] + 1, "timestamp": time.time(), "eof": True}
+            log(f"ABOUT TO SEND {json.dumps(ack_msg)}")
+
+            if sock.sendto(json.dumps(ack_msg).encode(), addr) < len(json.dumps(ack_msg)):
+                log("[error] unable to fully send acknowledgment")
+            else:
+                log(f"[SENDING FINAL EOF ACK] {decoded['sequence'] + 1}")
+
+            print_packets_in_order()
+            log("[completed]")
+            sys.exit(0)
+
+        if decoded['data']:
+            packets_received[decoded["sequence"]] = decoded
+            data = b64decode(decoded['data'].encode())
+            log(f"\n[UPDATING RECEIVED PACKETS] {packets_received}")
+            log(f"[recv data] {decoded['sequence']} ({len(data)}) ACCEPTED (in-order)")
+
+        last_ack = decoded['sequence']
+        ack_msg = {"ack": decoded['sequence'] + len(data), "timestamp": time.time(), "eof": False}
+        log(f"ABOUT TO SEND {json.dumps(ack_msg)}")
+
+        if sock.sendto(json.dumps(ack_msg).encode(), addr) < len(json.dumps(ack_msg)):
+            log("[error] unable to fully send acknowledgment")
+
+    except (ValueError, KeyError, TypeError):
+        log("[recv corrupt packet]")
+
+    except socket.timeout:
+        # Handle timeout and send cumulative acknowledgment
+        decoded = json.loads(packets_received[last_ack])
         data = b64decode(decoded['data'].encode())
-        # If we receive data, we assume it's in-order
-        # You will need to do much more here
-        log("[recv data] " + str(decoded['sequence']) + " (" + str(len(data)) + ") ACCEPTED (in-order)")
-        sys.stdout.buffer.write(data)
+        ack_msg = {"ack": decoded['sequence'] + len(data), "timestamp": time.time(), "eof": decoded['eof']}
+        log(f"ABOUT TO SEND {json.dumps(ack_msg)}")
 
-      # Send back an ack to the sender
-      msg = json.dumps({"ack": decoded['sequence'] + len(data)})
-      log("ABOUT TO SEND " + msg)
-      if sock.sendto(msg.encode(), addr) < len(msg):
-        log("[error] unable to fully send packet")
+        if sock.sendto(json.dumps(ack_msg).encode(), addr) < len(json.dumps(ack_msg)):
+            log("[error] unable to fully send acknowledgment")
 
-    except (ValueError, KeyError, TypeError) as e:
-      log("[recv corrupt packet]")
-      raise e
-  else:
-    log("[error] timeout")
-    sys.exit(-1)
+        log("[error] timeout")
+        sys.exit(-1)
