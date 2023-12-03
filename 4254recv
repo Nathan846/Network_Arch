@@ -1,0 +1,120 @@
+#!/usr/bin/python3 -u
+#
+
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+from base64 import b64decode
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+MSG_SIZE = 1500
+TIMEOUT = 30
+SEQUENCE = 0
+PACKET_TIME = 0.5
+MAX_RETRANSMISSION = 30
+packets_recieved = {}
+acks_sent = {}
+last_ack = 0
+
+# Bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = int(sys.argv[1])               # ./4254recv <recv_port>, this variable is the recv_port
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# Get port we bound to
+UDP_PORT = sock.getsockname()[1]
+log("[bound] " + str(UDP_PORT))
+
+# Function to print packets out in order after all have been received
+# Future Implementation: Fix receiver to print output in order periodically, increase speed and efficiency 
+def print_packets_in_order():
+  sorted_packets = dict(sorted(packets_recieved.items()))
+  for packet in sorted_packets.values():
+    data = b64decode(packet['data'].encode())    
+    sys.stdout.buffer.write(data)
+
+# Function to send a single packet given a sequence number and destination address
+def send_single_ack(seq, addr):
+    curr_time = time.time()
+    msg = json.dumps({"ack": seq, "timestamp": curr_time})
+    if sock.sendto(msg.encode(), addr) < len(msg):
+      log("[error] unable to fully send packet")
+    else:
+      log("[sending ACK] " + str(SEQUENCE))
+    acks_sent[seq] = (msg, curr_time, 1)
+
+
+# Function to ensure lost ACKs are eventually retransmitted -- essentially same as the version in the sender
+def retransmit():
+    curr_time = time.time()
+    for seq, (data, time_sent, send_count) in list(acks_sent.items()):
+        if (curr_time - time_sent > PACKET_TIME):
+            if send_count < MAX_RETRANSMISSION:
+                send_single_ack(seq)
+                # Update the send count and timestamp
+                acks_sent[seq] = (data, time.time(), send_count + 1)
+                log("Resending ACK: " + str(seq) + " (ATTEMPT: " + str(send_count + 1) + ")")
+            else:
+                log("Max retransmissions reached for sequence: " + str(seq))
+                del acks_sent[seq]
+
+
+# Now listen for packets
+while True:
+  try:
+    readable, writable, exceptional = select.select([sock], [], [], PACKET_TIME )
+
+    # If nothing is ready, we hit the timeout
+    if readable:
+      # recvfrom returns a bytes object read from an UDP socket and the address of the client socket as a tuple.
+      # # The return value is a pair (bytes, address) where bytes is a bytes object representing the data received and address is the address of the socket sending the data
+      (data, addr) = sock.recvfrom(MSG_SIZE)
+      decoded = json.loads(data.decode())
+
+      # If the EOF flag is set, print all received packets in order and exit
+      if (decoded['eof']):
+        packets_recieved[decoded['sequence']+1] = decoded
+        print_packets_in_order()
+        log("[completed]")
+        sys.exit(0)
+
+      # If there is data, we accept it and print it out
+      if (decoded['data']):
+        #packets_recieved[decoded["sequence"]] = decoded
+        data = b64decode(decoded['data'].encode())
+        seq = decoded['sequence']
+        
+        # Expected ACK
+        if (seq == SEQUENCE):
+          packets_recieved[seq] = decoded
+          SEQUENCE += len(data)
+          send_single_ack(SEQUENCE, addr)
+        # Out of order
+        elif (seq > SEQUENCE):
+          if (seq not in packets_recieved):
+            packets_recieved[seq] = decoded
+          # Send ack for last received packet
+          send_single_ack(SEQUENCE, addr)
+        # Duplicate ACK
+        else:
+          packets_recieved[seq] = decoded
+          send_single_ack(SEQUENCE, addr)
+    #else:
+    #  log("[error] timeout")
+    #  sys.exit(-1)
+    retransmit()
+
+  except (ValueError, KeyError, TypeError) as e:
+    log("[recv corrupt packet]")
+    continue
